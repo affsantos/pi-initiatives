@@ -1,0 +1,21 @@
+{
+  "name": "pi-initiatives",
+  "version": "1.0.0",
+  "description": "Initiative and project tracker for pi — manage initiatives, todos, and PRs with a split-panel TUI and LLM-callable tools.",
+  "keywords": ["pi-package"],
+  "author": "Andre Santos",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/affsantos/pi-initiatives"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@mariozechner/pi-ai": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/initiatives"]
+  }
+}
