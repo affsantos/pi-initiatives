@@ -11,11 +11,17 @@ pi install git:github.com/affsantos/pi-initiatives
 ## Quick Start
 
 ```bash
-# 1. Create your initiatives folder and teams
+# Install the package, start pi, then run:
+/initiatives
+```
+
+On first run, `pi-initiatives` will guide you through creating your initiatives root folder and one or more team folders.
+
+If you prefer to set things up manually, you can still do:
+
+```bash
 mkdir -p ~/Initiatives/"Engineering"
 mkdir -p ~/Initiatives/"Product"
-
-# 2. Start pi — use /initiatives to get started
 pi
 ```
 

@@ -73,27 +73,51 @@ interface TeamDef {
 	folder: string;
 }
 
-function getInitiativesDir(): string {
+const PI_SETTINGS_PATH = path.join(homedir(), ".pi", "agent", "settings.json");
+const DEFAULT_INITIATIVES_DIR = path.join(homedir(), "Initiatives");
+
+function expandHomePath(value: string): string {
+	if (value === "~") return homedir();
+	if (value.startsWith("~/")) return path.join(homedir(), value.slice(2));
+	return value;
+}
+
+function collapseHomePath(value: string): string {
+	const home = homedir();
+	if (value === home) return "~";
+	if (value.startsWith(home + path.sep)) return `~/${value.slice(home.length + 1)}`;
+	return value;
+}
+
+function readPiSettings(): Record<string, any> {
+	if (!existsSync(PI_SETTINGS_PATH)) return {};
+	const raw = readFileSync(PI_SETTINGS_PATH, "utf-8");
+	return JSON.parse(raw);
+}
+
+function getPreferredInitiativesDir(): string {
 	// 1. Check settings.json
-	const settingsPath = path.join(homedir(), ".pi", "agent", "settings.json");
-	if (existsSync(settingsPath)) {
+	if (existsSync(PI_SETTINGS_PATH)) {
 		try {
-			const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			const settings = readPiSettings();
 			const dir = settings?.["pi-initiatives"]?.dir;
-			if (typeof dir === "string") {
-				const expanded = dir.startsWith("~/") ? path.join(homedir(), dir.slice(2)) : dir;
-				if (existsSync(expanded)) return expanded;
+			if (typeof dir === "string" && dir.trim()) {
+				return expandHomePath(dir.trim());
 			}
 		} catch { /* ignore */ }
 	}
 
 	// 2. Check environment variable
-	if (process.env.PI_INITIATIVES_DIR && existsSync(process.env.PI_INITIATIVES_DIR)) {
-		return process.env.PI_INITIATIVES_DIR;
+	if (typeof process.env.PI_INITIATIVES_DIR === "string" && process.env.PI_INITIATIVES_DIR.trim()) {
+		return expandHomePath(process.env.PI_INITIATIVES_DIR.trim());
 	}
 
 	// 3. Default
-	return path.join(homedir(), "Initiatives");
+	return DEFAULT_INITIATIVES_DIR;
+}
+
+function getInitiativesDir(): string {
+	return getPreferredInitiativesDir();
 }
 
 function discoverTeams(initiativesDir: string): TeamDef[] {
@@ -114,6 +138,84 @@ function discoverTeams(initiativesDir: string): TeamDef[] {
 		}
 	} catch { /* dir unreadable */ }
 	return teams.sort((a, b) => a.display.localeCompare(b.display));
+}
+
+function refreshInitiativesRuntimeState(): void {
+	INITIATIVES_DIR = getInitiativesDir();
+	INITIATIVE_TEAMS = discoverTeams(INITIATIVES_DIR);
+}
+
+function isValidCustomRootPath(value: string): boolean {
+	const trimmed = value.trim();
+	if (!trimmed) return false;
+	if (trimmed === "~" || trimmed.startsWith("~/")) return true;
+	return path.isAbsolute(trimmed);
+}
+
+function normalizeTeamNames(input: string): { names?: string[]; error?: string } {
+	const names = input
+		.split(",")
+		.map((name) => name.trim())
+		.filter(Boolean);
+
+	if (names.length === 0) {
+		return { error: "Enter at least one team or department name." };
+	}
+
+	for (const name of names) {
+		if (name.includes("/") || name.includes("\\")) {
+			return { error: `Invalid team name: "${name}". Team names cannot contain / or \\.` };
+		}
+	}
+
+	return { names: [...new Set(names)] };
+}
+
+async function createInitiativesRootFolder(dir: string): Promise<void> {
+	await fs.mkdir(dir, { recursive: true });
+}
+
+async function createTeamFolders(rootDir: string, teamNames: string[]): Promise<void> {
+	for (const teamName of teamNames) {
+		await fs.mkdir(path.join(rootDir, teamName), { recursive: true });
+	}
+}
+
+async function persistCustomInitiativesDir(dir: string): Promise<void> {
+	const settingsDir = path.dirname(PI_SETTINGS_PATH);
+	await fs.mkdir(settingsDir, { recursive: true });
+
+	let settings: Record<string, any> = {};
+	if (existsSync(PI_SETTINGS_PATH)) {
+		settings = readPiSettings();
+	}
+
+	settings["pi-initiatives"] = {
+		...(settings["pi-initiatives"] ?? {}),
+		dir: collapseHomePath(dir),
+	};
+
+	await fs.writeFile(PI_SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n", "utf8");
+}
+
+interface SetupState {
+	preferredDir: string;
+	rootExists: boolean;
+	teams: TeamDef[];
+	initiativeCount: number;
+	needsOnboarding: boolean;
+}
+
+function getSetupState(initiatives: Initiative[] = []): SetupState {
+	const preferredDir = getPreferredInitiativesDir();
+	const teams = discoverTeams(preferredDir);
+	return {
+		preferredDir,
+		rootExists: existsSync(preferredDir),
+		teams,
+		initiativeCount: initiatives.length,
+		needsOnboarding: !existsSync(preferredDir) || teams.length === 0,
+	};
 }
 
 let INITIATIVES_DIR = getInitiativesDir();
@@ -663,8 +765,7 @@ function parsePullRequests(content: string): PullRequest[] {
 async function scanInitiatives(): Promise<Initiative[]> {
 	const initiatives: Initiative[] = [];
 	// Re-resolve config on each scan so new folders / env changes are picked up
-	INITIATIVES_DIR = getInitiativesDir();
-	INITIATIVE_TEAMS = discoverTeams(INITIATIVES_DIR);
+	refreshInitiativesRuntimeState();
 	if (!existsSync(INITIATIVES_DIR)) return initiatives;
 
 	const teams = await fs.readdir(INITIATIVES_DIR);
@@ -2445,13 +2546,30 @@ export default function initiativesExtension(pi: ExtensionAPI) {
 		description: "Browse and resume initiatives",
 		handler: async (args, ctx) => {
 			await refreshInitiatives(ctx);
-
-			if (cachedInitiatives.length === 0) {
-				ctx.ui.notify("No initiatives found in " + INITIATIVES_DIR, "warning");
-				return;
-			}
+			const setupState = getSetupState(cachedInitiatives);
 
 			if (!ctx.hasUI) {
+				if (setupState.needsOnboarding) {
+					console.log("First-run setup is incomplete for pi-initiatives.");
+					console.log("");
+					console.log(`Preferred initiatives folder: ${setupState.preferredDir}`);
+					if (!setupState.rootExists) {
+						console.log(`Create it with: mkdir -p ${JSON.stringify(setupState.preferredDir)}`);
+					}
+					console.log(`Create at least one team folder under it, for example:`);
+					console.log(`  mkdir -p ${JSON.stringify(path.join(setupState.preferredDir, "Engineering"))}`);
+					console.log("");
+					console.log("To use a custom root folder, add this to ~/.pi/agent/settings.json:");
+					console.log(JSON.stringify({ "pi-initiatives": { dir: "~/CustomPath" } }, null, 2));
+					return;
+				}
+
+				if (cachedInitiatives.length === 0) {
+					console.log(`No initiatives found in ${INITIATIVES_DIR}`);
+					console.log("Run /initiatives with UI to create your first initiative.");
+					return;
+				}
+
 				for (const init of cachedInitiatives) {
 					const icon = statusIcon(init.status);
 					const openTodos = init.todos.filter((t) => t.state === "open").length;
@@ -2483,6 +2601,213 @@ export default function initiativesExtension(pi: ExtensionAPI) {
 					activeComponent = comp;
 					if (activeComponent && "focused" in activeComponent) activeComponent.focused = wrapperFocused;
 					tui.requestRender();
+				};
+
+				const showSetupCreateFirstInitiative = () => {
+					const items: SelectItem[] = [
+						{ value: "yes", label: "Yes", description: "Open the initiative creation wizard now" },
+						{ value: "no", label: "Not now", description: "Open the normal /initiatives browser" },
+					];
+					const container = new Container();
+					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("accent", theme.bold(" First-Run Setup — Create First Initiative")), 1, 0));
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("text", " Setup is ready. Do you want to create your first initiative now?"), 1, 0));
+					container.addChild(new Spacer(1));
+
+					const selectList = new SelectList(items, items.length, {
+						selectedPrefix: (t) => theme.fg("accent", t),
+						selectedText: (t) => theme.fg("accent", t),
+						description: (t) => theme.fg("muted", t),
+						scrollInfo: (t) => theme.fg("dim", t),
+						noMatch: (t) => theme.fg("warning", t),
+					});
+					selectList.onSelect = (item) => {
+						if (item.value === "yes") {
+							showWizardTeam({ onTeamCancel: () => showSetupCreateFirstInitiative() });
+							return;
+						}
+						showInitiativeSelector();
+					};
+					selectList.onCancel = () => showInitiativeSelector();
+
+					container.addChild(selectList);
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("dim", " ↑↓ select · Enter confirm · Esc continue to browser"), 1, 0));
+					container.addChild(new Spacer(1));
+					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+					setActive({
+						render: (w) => container.render(w),
+						invalidate: () => container.invalidate(),
+						handleInput: (data) => { selectList.handleInput(data); tui.requestRender(); },
+					});
+				};
+
+				const showSetupTeamInput = () => {
+					const container = new Container();
+					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("accent", theme.bold(" First-Run Setup — Teams / Departments")), 1, 0));
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("text", " Teams or departments are just top-level folders that help organize initiatives."), 1, 0));
+					container.addChild(new Text(theme.fg("muted", " Enter one or more names, separated by commas."), 1, 0));
+					container.addChild(new Text(theme.fg("dim", ` Root: ${INITIATIVES_DIR}`), 1, 0));
+
+					const input = new Input();
+					container.addChild(input);
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("dim", " Enter to create folders · Esc cancel"), 1, 0));
+					container.addChild(new Spacer(1));
+					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+					input.onSubmit = async () => {
+						const parsed = normalizeTeamNames(input.getValue());
+						if (!parsed.names) {
+							ctx.ui.notify(parsed.error ?? "Invalid team names", "error");
+							return;
+						}
+
+						try {
+							await createTeamFolders(INITIATIVES_DIR, parsed.names);
+							await refreshInitiatives(ctx);
+							ctx.ui.notify(`✅ Created team folders in ${INITIATIVES_DIR}`, "info");
+							if (cachedInitiatives.length === 0) {
+								showSetupCreateFirstInitiative();
+							} else {
+								showInitiativeSelector();
+							}
+						} catch (e: any) {
+							ctx.ui.notify(`Error: ${e.message}`, "error");
+						}
+					};
+
+					setActive({
+						get focused() { return input.focused; },
+						set focused(v: boolean) { input.focused = v; },
+						render: (w) => container.render(w),
+						invalidate: () => container.invalidate(),
+						handleInput: (data) => {
+							const kb = getKeybindings();
+							if (kb.matches(data, "tui.select.cancel")) {
+								done();
+								return;
+							}
+							input.handleInput(data);
+							tui.requestRender();
+						},
+					});
+				};
+
+				const showSetupCustomRootInput = () => {
+					const container = new Container();
+					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("accent", theme.bold(" First-Run Setup — Custom Root Folder")), 1, 0));
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("muted", " Enter an absolute path or ~/..."), 1, 0));
+
+					const input = new Input();
+					input.setValue(collapseHomePath(INITIATIVES_DIR));
+					container.addChild(input);
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("dim", " Enter to save and continue · Esc back"), 1, 0));
+					container.addChild(new Spacer(1));
+					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+					input.onSubmit = async () => {
+						const rawValue = input.getValue().trim();
+						if (!isValidCustomRootPath(rawValue)) {
+							ctx.ui.notify("Invalid path. Use ~/... or an absolute path.", "error");
+							return;
+						}
+
+						const expanded = expandHomePath(rawValue);
+						try {
+							await createInitiativesRootFolder(expanded);
+							await persistCustomInitiativesDir(expanded);
+							await refreshInitiatives(ctx);
+							ctx.ui.notify(`✅ Using ${collapseHomePath(expanded)} for initiatives`, "info");
+							showSetupTeamInput();
+						} catch (e: any) {
+							ctx.ui.notify(`Error: ${e.message}`, "error");
+						}
+					};
+
+					setActive({
+						get focused() { return input.focused; },
+						set focused(v: boolean) { input.focused = v; },
+						render: (w) => container.render(w),
+						invalidate: () => container.invalidate(),
+						handleInput: (data) => {
+							const kb = getKeybindings();
+							if (kb.matches(data, "tui.select.cancel")) {
+								showSetupRootChoice();
+								return;
+							}
+							input.handleInput(data);
+							tui.requestRender();
+						},
+					});
+				};
+
+				const showSetupRootChoice = () => {
+					const suggestedDir = INITIATIVES_DIR;
+					const isDefaultSuggestion = suggestedDir === DEFAULT_INITIATIVES_DIR;
+					const items: SelectItem[] = [
+						{ value: "default", label: `Use ${collapseHomePath(suggestedDir)}`, description: isDefaultSuggestion ? "Create the default initiatives folder" : "Create the currently configured initiatives folder" },
+						{ value: "custom", label: "Choose another path", description: "Use and persist a custom root folder" },
+						{ value: "cancel", label: "Cancel", description: "Exit setup" },
+					];
+
+					const container = new Container();
+					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("accent", theme.bold(" First-Run Setup — Initiatives Folder")), 1, 0));
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("text", ` I couldn’t find your initiatives folder. Create one at ${collapseHomePath(suggestedDir)}?`), 1, 0));
+					container.addChild(new Spacer(1));
+
+					const selectList = new SelectList(items, items.length, {
+						selectedPrefix: (t) => theme.fg("accent", t),
+						selectedText: (t) => theme.fg("accent", t),
+						description: (t) => theme.fg("muted", t),
+						scrollInfo: (t) => theme.fg("dim", t),
+						noMatch: (t) => theme.fg("warning", t),
+					});
+					selectList.onSelect = async (item) => {
+						if (item.value === "cancel") {
+							done();
+							return;
+						}
+						if (item.value === "custom") {
+							showSetupCustomRootInput();
+							return;
+						}
+
+						try {
+							await createInitiativesRootFolder(suggestedDir);
+							await refreshInitiatives(ctx);
+							ctx.ui.notify(`✅ Created ${collapseHomePath(suggestedDir)}`, "info");
+							showSetupTeamInput();
+						} catch (e: any) {
+							ctx.ui.notify(`Error: ${e.message}`, "error");
+						}
+					};
+					selectList.onCancel = () => done();
+
+					container.addChild(selectList);
+					container.addChild(new Spacer(1));
+					container.addChild(new Text(theme.fg("dim", " ↑↓ select · Enter confirm · Esc cancel"), 1, 0));
+					container.addChild(new Spacer(1));
+					container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+					setActive({
+						render: (w) => container.render(w),
+						invalidate: () => container.invalidate(),
+						handleInput: (data) => { selectList.handleInput(data); tui.requestRender(); },
+					});
 				};
 
 				// ── Helper: build action menu for an initiative ──
@@ -3190,6 +3515,7 @@ export default function initiativesExtension(pi: ExtensionAPI) {
 					stakeholders?: string;
 					description?: string;
 					tags?: string;
+					onTeamCancel?: () => void;
 				}
 
 				/** Add accumulated wizard context to a container */
@@ -3298,7 +3624,8 @@ export default function initiativesExtension(pi: ExtensionAPI) {
 				};
 
 				// ── Wizard Step 1: Team ──
-				const showWizardTeam = (state: WizardState) => {
+				const showWizardTeam = (state: WizardState, onCancel?: () => void) => {
+					state.onTeamCancel = onCancel ?? state.onTeamCancel ?? (() => showInitiativeSelector());
 					wizardSelectStep("Team", state,
 						INITIATIVE_TEAMS.map(t => ({ value: t.folder, label: t.display, description: "" })),
 						(value) => {
@@ -3307,7 +3634,7 @@ export default function initiativesExtension(pi: ExtensionAPI) {
 							state.teamSlug = team.slug;
 							showWizardName(state);
 						},
-						() => showInitiativeSelector(),
+						state.onTeamCancel,
 					);
 				};
 
@@ -3524,7 +3851,15 @@ export default function initiativesExtension(pi: ExtensionAPI) {
 					});
 				};
 
-				showInitiativeSelector();
+				if (setupState.needsOnboarding) {
+					if (setupState.rootExists) {
+						showSetupTeamInput();
+					} else {
+						showSetupRootChoice();
+					}
+				} else {
+					showInitiativeSelector();
+				}
 
 				// ── Root wrapper ──
 				return {
